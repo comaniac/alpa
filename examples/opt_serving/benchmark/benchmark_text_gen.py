@@ -17,6 +17,7 @@ python benchmark_text_gen.py --model alpa/opt-2.7b --forward
 Notes:
 1. fp32 does not work now because of embedding
 """
+
 import argparse
 
 import alpa
@@ -68,7 +69,7 @@ if __name__ == "__main__":
 
     if autoregressive:
         assert num_micro_batches == 1, "we only support num_micro_batches=1 for autoregressive!"
-        assert decoder_length_per_step == 1, "Decoding one token at a time!"
+        # assert decoder_length_per_step == 1, "Decoding one token at a time!"
         assert batch_size == 1, "batch_size > 1 in autoregressive is not tested!"
 
     decode_speeds = []
@@ -155,6 +156,13 @@ if __name__ == "__main__":
             tflopss.append(tflops)
             compute_tflopss.append(compute_tflops)
     else:
+        if decoder_length_per_step != 1:
+            # Get the longest length.
+            decoder_length_per_step = max([len(prompt.split()) for prompt in test_prompts])
+            # Round up to power of 2.
+            decoder_length_per_step = 1 << int(math.log2(decoder_length_per_step - 1)) + 1
+            print("Decoder length is set to:", decoder_length_per_step)
+
         # generation mode
         tic = time.time()
         model = get_model(args.model,
@@ -162,12 +170,20 @@ if __name__ == "__main__":
                           args.path,
                           autoregressive,
                           dtype=dtype,
+                          decoding_length_per_step=decoder_length_per_step,
                           dummy=args.dummy)
         load_time = time.time() - tic
 
-        # warm up
-        input_ids = tokenizer("Paris is the capital city of",
-                              return_tensors="pt").input_ids.to(args.device)
+        # Warmup. Pad the input to the target length.
+        if decoder_length_per_step != 1:
+            input_ids = tokenizer("Paris is the capital city of",
+                                  padding="max_length",
+                                  max_length=decoder_length_per_step,
+                                  return_tensors="pt").input_ids.to(args.device)
+        else:
+            input_ids = tokenizer("Paris is the capital city of",
+                                  return_tensors="pt").input_ids.to(args.device)
+
         output = model.generate(input_ids=input_ids,
                                 max_length=256,
                                 do_sample=False,
@@ -186,12 +202,19 @@ if __name__ == "__main__":
         else:
             num_gpus = 1
 
-        # benchmark
-        for i in range(n_iters):
-            prompt = test_prompts[i]
+        for idx in range(n_iters):
+            prompt = test_prompts[idx % len(test_prompts)]
+
             torch.manual_seed(8)
-            input_ids = tokenizer(prompt,
-                                  return_tensors="pt").input_ids.to(args.device)
+            # Pad the input to the target length.
+            if decoder_length_per_step != 1:
+                input_ids = tokenizer(prompt,
+                                      padding="max_length",
+                                      max_length=decoder_length_per_step,
+                                      return_tensors="pt").input_ids.to(args.device)
+            else:
+                input_ids = tokenizer(prompt,
+                                      return_tensors="pt").input_ids.to(args.device)
             tic = time.time()
             output = model.generate(input_ids=input_ids,
                                     max_length=256,
@@ -239,7 +262,7 @@ if __name__ == "__main__":
     ]
     values = [
         args.model, args.device, args.dummy, f"{load_time:.2f}",
-        f"{autoregressive}", f"{batch_size}", f"{num_micro_batches}", "2",
+        f"{autoregressive}", f"{batch_size}", f"{num_micro_batches}", "1",
         f"{decoder_length_per_step}", f"{avg_tflops:.4f}",
         f"{avg_compute_tflops:.4f}", f"{avg_speed:.2f}",
         f"{latency_32_tokens:.2f}"

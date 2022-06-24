@@ -10,8 +10,8 @@ from transformers.generation_utils import GenerationMixin, ModelOutput, dataclas
 from transformers import OPTForCausalLM, GPT2LMHeadModel
 
 from examples.opt_serving.model.opt_model import (
-    get_opt_config, get_pipeshard_executable, load_params_dis_array,
-    init_cache_dis_array, load_params_np, init_cache_np, get_jax_executable)
+    get_opt_config, get_pipeshard_executable, load_multi_executable_params_dis_array,
+    init_multi_executable_cache_dis_array, load_params_np, init_cache_np, get_jax_executable)
 from examples.opt_serving.model.opt_utils import TransformerModelConfig
 
 
@@ -92,12 +92,17 @@ class WrappedInferenceFunc(GenerationMixin):
                  output_attentions=None,
                  output_hidden_states=None,
                  return_dict=None):
-        for i in range(input_ids.shape[1]):
-            ret = self.inference_func(input_ids[:, i:i + 1],
-                                      past_key_values,
-                                      output_hidden_states=output_hidden_states,
-                                      output_attentions=output_attentions)
-            past_key_values = ret.past_key_values
+        ret = self.inference_func(input_ids,
+                                    past_key_values,
+                                    output_hidden_states=output_hidden_states,
+                                    output_attentions=output_attentions)
+        past_key_values = ret.past_key_values
+        # for i in range(input_ids.shape[1]):
+        #     ret = self.inference_func(input_ids[:, i:i + 1],
+        #                               past_key_values,
+        #                               output_hidden_states=output_hidden_states,
+        #                               output_attentions=output_attentions)
+        #     past_key_values = ret.past_key_values
         return ret
 
 
@@ -183,9 +188,9 @@ def get_model(model_name: str,
     if not model_name.startswith("alpa") and not autoregressive:
         raise NotImplementedError(
             f"Cannot support {model_name} in forward-only mode.")
-    if autoregressive and decoding_length_per_step > 1:
-        raise RuntimeError(
-            f"Autoregressive requires decoder_length_per_step == 1")
+    # if autoregressive and decoding_length_per_step > 1:
+    #     raise RuntimeError(
+    #         f"Autoregressive requires decoder_length_per_step == 1")
     if autoregressive and num_micro_batches > 1:
         raise NotImplementedError(
             f"Cannot support num_micro_batches > 1 in autoregressive mode.")
@@ -229,7 +234,7 @@ def get_model(model_name: str,
         )
 
         alpa.init()
-        num_pp_stages = max(2, alpa.get_global_cluster().num_hosts)
+        num_pp_stages = 1#max(2, alpa.get_global_cluster().num_hosts)
         config = get_opt_config(name, num_pp_stages=num_pp_stages, dtype=dtype)
         transformer_config = TransformerModelConfig(
             H=config.decoder_embed_dim,
@@ -238,7 +243,7 @@ def get_model(model_name: str,
             seq_len=config.max_target_positions,
             vocab_size=config.vocab_size)
 
-        executable, params_aval = get_pipeshard_executable(
+        (executable_prompt, executable), params_aval = get_pipeshard_executable(
             config,
             batch_size=batch_size,
             num_micro_batches=num_micro_batches,
@@ -247,15 +252,16 @@ def get_model(model_name: str,
             support_output_hidden_states=support_output_hidden_states,
             autoregressive=autoregressive)
 
-        # load params
-        params = load_params_dis_array(path, executable, params_aval, config,
-                                       dummy)
+        # Load params
+        params_prompt, params = load_multi_executable_params_dis_array(path,
+                                    [executable_prompt, executable], params_aval, config, dummy)
         if autoregressive:
-            init_cache = init_cache_dis_array(executable,
-                                              config,
-                                              1,
-                                              dummy=dummy)
+            init_cache = init_multi_executable_cache_dis_array([executable_prompt, executable],
+                                                               config, 1, dummy=dummy)
             set_skip_shard_args_check(init_cache)
+
+        if executable_prompt is not None:
+            executable_prompt.sync()
         executable.sync()
 
         # return executable directly if not autoregressive
@@ -270,27 +276,40 @@ def get_model(model_name: str,
                        output_hidden_states=False):
         nonlocal step_ct
 
-        if past_key_values is None:
-            past_key_values = init_cache
-            step_ct = 0
+        def _wrapper(_executable, _params, _input_ids, _past_key_values):
+            nonlocal step_ct
 
-        input_ids_step = input_ids.cpu().numpy()
-        position_ids_step = np.full_like(input_ids_step,
-                                         step_ct + config.pad + 1)
+            if _past_key_values is None:
+                _past_key_values = init_cache
+                step_ct = 0
 
-        output = executable(
-            params, {
-                "input_ids": input_ids_step,
-                "position_ids": position_ids_step,
-                "cache": past_key_values,
-            })
-        set_skip_shard_args_check(output.attention_cache)
+            input_ids_step = _input_ids.cpu().numpy()
+            position_ids_step = np.full_like(input_ids_step,
+                                             step_ct + config.pad + 1)
+            output = _executable(
+                _params, {
+                    "input_ids": input_ids_step,
+                    "position_ids": position_ids_step,
+                    "cache": _past_key_values,
+                })
 
-        logits_step = torch.from_numpy(np.array(output.logits)).to(device)
+            set_skip_shard_args_check(output.attention_cache)
+            logits_step = torch.from_numpy(np.array(output.logits)).to(device)
 
-        step_ct += 1
-        return InferenceFuncOutput(logits_step, output.attention_cache,
-                                   output.hidden_states, output.attentions)
+            step_ct += 1
+            return InferenceFuncOutput(logits_step, output.attention_cache,
+                                       output.hidden_states, output.attentions)
+
+        if input_ids.shape[1] > 1:
+            if executable_prompt is None:
+                # Break prompt if no prompt executable is available.
+                for i in range(input_ids.shape[1]):
+                    ret = _wrapper(executable, params, input_ids[:, i:i + 1], past_key_values)
+                    past_key_values = ret.past_key_values
+                return ret
+            return _wrapper(executable_prompt, params_prompt, input_ids, past_key_values)
+        return _wrapper(executable, params, input_ids, past_key_values)
+
 
     inference_func_config = InferenceFuncConfig()
     return WrappedInferenceFunc(inference_func, inference_func_config,

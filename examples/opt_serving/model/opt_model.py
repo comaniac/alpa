@@ -533,7 +533,7 @@ def init_cache_aval(config, batch_size):
     head_dim = config.decoder_embed_dim // config.decoder_attention_heads
 
     all_cache = []
-    for i in range(config.decoder_layers):
+    for _ in range(config.decoder_layers):
         layer_cache = (
             jax.core.ShapedArray((batch_size, config.max_target_positions,
                                   config.decoder_attention_heads, head_dim),
@@ -709,12 +709,34 @@ def get_pipeshard_executable(config,
             return output
 
         alpa.global_config.always_donate_micro_batch_vars = False
-        executable = inference_step_with_cache.get_executable(
+
+        cache = init_cache_aval(config, 1)
+
+        if decoding_length_per_step > 1:
+            print("Compiling prompt executable")
+            executable_prompt = inference_step_with_cache.get_executable(
+                params, {
+                    "input_ids":
+                        jax.core.ShapedArray(
+                            (batch_size, decoding_length_per_step), jnp.int32),
+                    "position_ids":
+                        jax.core.ShapedArray(
+                            (batch_size, decoding_length_per_step), jnp.int32),
+                    "cache": cache,
+                })
+            executable_prompt.dump_debug_info("tmp_prompt")
+        else:
+            executable_prompt = None
+
+        executable_token = inference_step_with_cache.get_executable(
             params, {
                 "input_ids": jax.core.ShapedArray((1, 1), jnp.int32),
                 "position_ids": jax.core.ShapedArray((1, 1), jnp.int32),
-                "cache": init_cache_aval(config, 1),
+                "cache": cache,
             })
+
+        executable_token.dump_debug_info("tmp_token")
+        return (executable_prompt, executable_token), params
     else:
 
         @alpa.parallelize(batch_argnums=(1,), method=method)
@@ -913,6 +935,28 @@ def load_params_dis_array(path, executable, params_aval, config, dummy=False):
                                                  flat_mesh_ids)
 
     return flat_arrays
+
+def load_multi_executable_params_dis_array(path, executables, params_aval, config, dummy=False):
+    ret = []
+    for executable in executables:
+        if executable is None:
+            ret.append(None)
+        else:
+            ret.append(load_params_dis_array(path, executable, params_aval, config, dummy))
+    return ret
+
+
+def init_multi_executable_cache_dis_array(executables, config, batch_size, dummy=False):
+    cache_info = None
+    for executable in executables:
+        if executable is None:
+            continue
+        _, batch_info = executable.get_input_placement_specs()
+        if cache_info is not None:
+            assert cache_info == batch_info["cache"], "All executables must share the same cache"
+        else:
+            cache_info = batch_info["cache"]
+    return init_cache_dis_array(executables[0], config, batch_size, dummy)   
 
 
 def init_cache_dis_array(executable, config, batch_size, dummy=False):
